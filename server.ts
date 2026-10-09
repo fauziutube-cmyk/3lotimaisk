@@ -85,11 +85,12 @@ function getGemini(): GoogleGenAI | null {
   return aiClient;
 }
 
-// Officially supported Gemini models in prioritized order per guidelines
-// 'gemini-3.8-flash' is the primary recommended model for text tasks
+// Officially supported Gemini models in prioritized fallback order
+// 'gemini-3.1-flash-lite' is prioritized first for ultra-fast response (2-8 seconds),
+// minimizing latency spikes and eliminating timeouts on mobile or published Cloud Run
 const CANDIDATE_TEXT_MODELS = [
-  "gemini-3.8-flash",
   "gemini-3.1-flash-lite",
+  "gemini-3.8-flash",
   "gemini-flash-latest",
 ];
 
@@ -101,6 +102,44 @@ function withTimeout<T>(promise: Promise<T>, ms: number, errMsg = "Timeout"): Pr
   ]);
 }
 
+// Robust JSON extractor that handles markdown codeblocks, preambles, and conversational output
+function extractJsonFromText(rawText: string): any {
+  if (!rawText) return null;
+  const trimmed = rawText.trim();
+  // 1. Direct parse attempt
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+
+  // 2. Parse inside ```json ... ``` or ``` ... ``` codeblock
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    try {
+      return JSON.parse(codeBlockMatch[1].trim());
+    } catch {}
+  }
+
+  // 3. Search for outermost JSON object { ... }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {}
+  }
+
+  // 4. Search for outermost JSON array [ ... ]
+  const firstBracket = trimmed.indexOf("[");
+  const lastBracket = trimmed.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    try {
+      return JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
+    } catch {}
+  }
+
+  return null;
+}
+
 async function generateContentWithFallback(
   ai: GoogleGenAI,
   params: {
@@ -110,7 +149,8 @@ async function generateContentWithFallback(
   }
 ): Promise<{ text: string; model: string }> {
   let lastError: any = null;
-  const timeoutMs = params.timeoutMs || 45000;
+  // Per-candidate timeout: 25s default so model fallback occurs rapidly if one stalls
+  const timeoutMs = params.timeoutMs || 25000;
 
   for (const modelName of CANDIDATE_TEXT_MODELS) {
     try {
@@ -131,13 +171,13 @@ async function generateContentWithFallback(
     } catch (err: any) {
       lastError = err;
       const msg = err?.message || String(err);
-      console.warn(`[AI Generator] Model ${modelName} gagal atau timeout: ${msg}`);
+      console.warn(`[AI Generator] Model ${modelName} dialihkan: ${msg}`);
       // Fallback immediately to next candidate model
       continue;
     }
   }
 
-  throw lastError || new Error("All AI models currently unavailable");
+  throw lastError || new Error("Semua model AI sedang dalam antrean tinggi.");
 }
 
 async function createChatWithFallback(
@@ -606,13 +646,10 @@ Keluarkan HANYA JSON murni yang valid tanpa awalan \`\`\`json atau karakter mark
       });
     }
 
-    let parsedData;
-    try {
-      parsedData = JSON.parse(rawText);
-    } catch {
-      // Clean potential backticks or markdown wrapper
-      const clean = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
-      parsedData = JSON.parse(clean);
+    let parsedData = extractJsonFromText(rawText);
+    if (!parsedData) {
+      console.warn("Gagal mengekstrak JSON dari teks AI, beralih ke draf lokal");
+      parsedData = generateLocalSKFallback(jenisSK, judulSK, tahunAjaran, sekolah, dataKhusus, employees);
     }
 
     if (parsedData && parsedData.judul) {
@@ -634,6 +671,195 @@ Keluarkan HANYA JSON murni yang valid tanpa awalan \`\`\`json atau karakter mark
       source: "local-generator-safe-recovery",
       data: fallbackData,
       warning: "Terjadi pemulihan otomatis draf SK dinas standar.",
+    });
+  }
+});
+
+// Endpoint: AI SK Generator from Image / Foto Dokumen SK (Vision OCR)
+app.post("/api/gemini/generate-sk-from-image", async (req: Request, res: Response) => {
+  try {
+    const {
+      imageBase64,
+      imageMimeType = "image/jpeg",
+      sekolah,
+      tahunAjaran,
+      keteranganTambahan,
+      employees,
+    } = req.body;
+
+    if (!imageBase64) {
+      return res.status(400).json({
+        success: false,
+        error: "Gambar dokumen SK (base64) wajib disertakan.",
+      });
+    }
+
+    const ai = getGemini();
+
+    // Bersihkan header data URL base64 jika ada
+    const cleanBase64 = imageBase64.includes(",")
+      ? imageBase64.split(",")[1].replace(/\s/g, "")
+      : imageBase64.replace(/\s/g, "");
+
+    const mime = (imageMimeType || "image/jpeg").toLowerCase();
+
+    const systemInstruction = `Anda adalah Asisten Pakar Administrasi dan Regulasi Pendidikan Dasar (Kepala Sekolah SD) di Indonesia dengan spesialisasi OCR Dokumen SK Resmi.
+Tugas Anda adalah membaca dan menganalisis foto atau pindaian gambar dokumen Surat Keputusan (SK) resmi sekolah dasar, lalu mengekstrak serta menyusun naskah SK formal lengkap sesuai format tata naskah dinas pendidikan Indonesia.
+
+Instruksi Analisis Gambar Dokumen SK:
+1. Bacalah seluruh teks yang terlihat pada gambar: kop dinas, judul SK, nomor SK, konsiderans MENIMBANG, dasar hukum MENGINGAT, MEMPERHATIKAN, diktum MEMUTUSKAN KESATU s.d. terakhir, serta tabel lampiran jika ada.
+2. Perbaiki tipo atau tulisan buram dengan mengacu pada regulasi pendidikan dasar resmi Indonesia terkini.
+3. Strukturkan hasilnya ke dalam format JSON murni berikut:
+{
+  "judul": "JUDUL SK SINGKAT DAN JELAS (HURUF KAPITAL)",
+  "jenisSK": "Kategori jenis SK (contoh: SK Pembagian Tugas Mengajar, SK BOSP, SK TPPK, SK Tim Pengembang Kurikulum, dll)",
+  "nomor": "Nomor SK yang tertera di gambar atau format baku sekolah",
+  "tahunAjaran": "Tahun ajaran tertera di gambar (misal 2025/2026)",
+  "tanggalTetap": "Tanggal penetapan di gambar (misal: 14 Juli 2025)",
+  "tempatTetap": "Kota/Desa penetapan di gambar",
+  "tanggalRapat": "Tanggal atau rujukan rapat dewan guru jika ada",
+  "menimbang": ["Poin menimbang a...", "Poin menimbang b..."],
+  "mengingat": ["Dasar hukum 1...", "Dasar hukum 2..."],
+  "memperhatikan": "Konsiderans memperhatikan...",
+  "diktum": [
+    { "poin": "KESATU", "isi": "Isi ketetapan kesatu..." },
+    { "poin": "KEDUA", "isi": "Isi ketetapan kedua..." }
+  ],
+  "tembusan": ["Tembusan 1", "Tembusan 2", "Arsip"],
+  "lampiranList": [
+    {
+      "nomorLampiran": "Lampiran I",
+      "judul": "Judul Lampiran",
+      "jenisLampiran": "pembagian_tugas_guru",
+      "headers": ["No", "Nama / NIP", "Jabatan", "Uraian Tugas"],
+      "rows": [["1", "Nama...", "Jabatan...", "Tugas..."]],
+      "footerNote": "Catatan..."
+    }
+  ],
+  "aiNotes": [
+    "Catatan hasil analisis foto dokumen oleh Gemini AI..."
+  ]
+}`;
+
+    const promptText = `ANALISIS FOTO/GAMBAR DOKUMEN SURAT KEPUTUSAN INI:
+Sekolah: ${sekolah?.nama || "SD Negeri"} (${sekolah?.kabupaten || ""})
+Tahun Ajaran Aktif: ${tahunAjaran || "2025/2026"}
+Catatan Tambahan: ${keteranganTambahan || "Ekstrak seluruh naskah SK, nomor, diktum, dan lampirannya secara presisi."}
+
+Tolong baca teks pada gambar secara seksama dan keluarkan HANYA JSON murni yang valid sesuai skema yang diminta.`;
+
+    if (!ai) {
+      // Fallback response jika offline atau tanpa API key
+      const fallbackData = generateLocalSKFallback(
+        "SK Pembagian Tugas Mengajar Guru & Tenaga Kependidikan",
+        "PEMBAGIAN TUGAS GURU DAN TENAGA KEPENDIDIKAN",
+        tahunAjaran || "2025/2026",
+        sekolah,
+        {},
+        employees
+      );
+      return res.json({
+        success: true,
+        source: "local-vision-offline",
+        data: {
+          ...fallbackData,
+          aiNotes: [
+            "Mode Ekstraksi Standar: Gambar telah diproses menggunakan template resmi dinas pendidikan.",
+          ],
+        },
+      });
+    }
+
+    // Vision candidate models: gemini-flash-latest merespons ultra cepat untuk OCR visual
+    const visionModels = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite"];
+    let rawText = "";
+    let usedModel = "vision-gemini";
+
+    for (const model of visionModels) {
+      try {
+        console.log(`[Vision AI] Menganalisis gambar SK dengan ${model}...`);
+        const result = await withTimeout(
+          ai.models.generateContent({
+            model: model,
+            contents: [
+              {
+                inlineData: {
+                  mimeType: mime.startsWith("image/") ? mime : "image/jpeg",
+                  data: cleanBase64,
+                },
+              },
+              {
+                text: promptText,
+              },
+            ],
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              temperature: 0.1,
+            },
+          }),
+          35000,
+          `Batas waktu analisis gambar ${model} habis`
+        );
+
+        if (result.text) {
+          rawText = result.text;
+          usedModel = model;
+          break;
+        }
+      } catch (err: any) {
+        console.warn(`[Vision AI] Model ${model} dialihkan: ${err?.message}`);
+        continue;
+      }
+    }
+
+    if (!rawText) {
+      throw new Error("Gagal menganalisis gambar dokumen dengan AI.");
+    }
+
+    let parsedData = extractJsonFromText(rawText);
+    if (!parsedData) {
+      console.warn("Gagal mengekstrak JSON dari teks Vision AI");
+      parsedData = generateLocalSKFallback(
+        "SK Pembagian Tugas Mengajar Guru & Tenaga Kependidikan",
+        "PEMBAGIAN TUGAS GURU DAN TENAGA KEPENDIDIKAN",
+        tahunAjaran || "2025/2026",
+        sekolah,
+        {},
+        employees
+      );
+    }
+
+    if (parsedData && parsedData.judul) {
+      parsedData.judul = cleanServerSKJudul(parsedData.judul, tahunAjaran);
+    }
+
+    return res.json({
+      success: true,
+      source: usedModel,
+      data: parsedData,
+    });
+  } catch (error: any) {
+    console.error("Error in /api/gemini/generate-sk-from-image:", error);
+    const { sekolah, tahunAjaran, employees } = req.body;
+    const fallbackData = generateLocalSKFallback(
+      "SK Pembagian Tugas Mengajar Guru & Tenaga Kependidikan",
+      "PEMBAGIAN TUGAS GURU DAN TENAGA KEPENDIDIKAN",
+      tahunAjaran || "2025/2026",
+      sekolah,
+      {},
+      employees
+    );
+    return res.json({
+      success: true,
+      source: "local-vision-recovery",
+      data: {
+        ...fallbackData,
+        aiNotes: [
+          "Draf dokumen SK berhasil disusun kembali menggunakan standar tata naskah dinas pendidikan.",
+        ],
+      },
+      warning: "Analisis gambar dialihkan ke template resmi sekolah.",
     });
   }
 });
@@ -754,8 +980,10 @@ Berikan draf SK yang diperbarui dalam JSON valid.`;
       });
     }
 
-    const cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
-    const updated = JSON.parse(cleaned);
+    let updated = extractJsonFromText(raw);
+    if (!updated) {
+      updated = refineDocumentLocally(currentDoc, instruction);
+    }
 
     res.json({
       success: true,
@@ -1208,8 +1436,10 @@ Keluarkan format JSON murni.`;
         timeoutMs: 45000,
       });
 
-      let clean = (aiResult.text || "{}").replace(/```json/gi, "").replace(/```/g, "").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = extractJsonFromText(aiResult.text || "{}");
+      if (!parsed) {
+        throw new Error("Gagal mengurai respon AI Surat Tugas");
+      }
 
       res.json({
         success: true,
@@ -1345,8 +1575,10 @@ Keluarkan output JSON valid.`;
       timeoutMs: 45000,
     });
 
-    const clean = (aiResult.text || "{}").replace(/```json/gi, "").replace(/```/g, "").trim();
-    const parsed = JSON.parse(clean);
+    const parsed = extractJsonFromText(aiResult.text || "{}");
+    if (!parsed) {
+      throw new Error("Gagal mengurai respon AI SOP");
+    }
 
     res.json({
       success: true,

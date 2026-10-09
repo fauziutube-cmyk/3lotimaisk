@@ -29,8 +29,14 @@ import {
   BookmarkCheck,
   Check,
   RefreshCw,
+  Camera,
+  Image as ImageIcon,
+  Upload,
+  FileUp,
+  X,
 } from "lucide-react";
-import { getSavedDefaultSKParams, saveDefaultSKParams } from "../utils/storage";
+import { getSavedDefaultSKParams, saveDefaultSKParams, loadActiveKopImage } from "../utils/storage";
+import { defaultKopSuratSDN3LoloanTimur } from "../data/defaultKopImage";
 
 interface SKBuilderWizardProps {
   initialDoc?: SKDocument | null;
@@ -54,6 +60,7 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
   onCancel,
 }) => {
   const [currentStep, setCurrentStep] = useState<number>(initialDoc ? 5 : 1);
+  const [creationMode, setCreationMode] = useState<"kategori" | "kebutuhan" | "gambar">("kategori");
   const [selectedSKType, setSelectedSKType] = useState<string>(
     initialDoc?.jenisSK || skCategories[0].nama
   );
@@ -61,6 +68,29 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
   const [isCustomMode, setIsCustomMode] = useState<boolean>(
     initialDoc?.jenisSK === "SK Lainnya (Custom AI)"
   );
+
+  // States untuk Fitur "Susun Sesuai Gambar / Foto Dokumen SK" (AI Vision OCR)
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [imageMimeType, setImageMimeType] = useState<string>("image/jpeg");
+  const [imageFileName, setImageFileName] = useState<string | null>(null);
+  const [imageAdditionalNote, setImageAdditionalNote] = useState<string>("");
+  const [isAnalyzingImage, setIsAnalyzingImage] = useState<boolean>(false);
+  const [imageAnalysisError, setImageAnalysisError] = useState<string | null>(null);
+
+  // Kop Surat resolved image
+  const [activeKopUrl, setActiveKopUrl] = useState<string | null>(() => {
+    return profile.kopSuratUrl && !profile.kopSuratUrl.startsWith("indexeddb:")
+      ? profile.kopSuratUrl
+      : defaultKopSuratSDN3LoloanTimur;
+  });
+
+  React.useEffect(() => {
+    loadActiveKopImage(profile.kopSuratUrl || defaultKopSuratSDN3LoloanTimur).then((resolved) => {
+      if (resolved && !resolved.startsWith("indexeddb:")) {
+        setActiveKopUrl(resolved);
+      }
+    });
+  }, [profile.kopSuratUrl]);
 
   // Step 3: Specific Data - Muat dari data bawaan yang sudah diisikan pengguna
   const defaultParams = getSavedDefaultSKParams(initialDoc || existingDocuments?.[0]);
@@ -450,6 +480,162 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
     return synced;
   };
 
+  // Helper membaca file gambar menjadi DataURL Base64
+  const handleImageFileSelect = (file: File) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setImageAnalysisError("File harus berupa gambar (JPG, PNG, WebP).");
+      return;
+    }
+    setImageAnalysisError(null);
+    setImageFileName(file.name);
+    setImageMimeType(file.type);
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      setImagePreviewUrl(result);
+    };
+    reader.onerror = () => {
+      setImageAnalysisError("Gagal membaca file gambar.");
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Trigger AI Draft Generation Sesuai Gambar / Foto Dokumen SK (Vision OCR)
+  const handleGenerateDraftFromImage = async () => {
+    if (!imagePreviewUrl) {
+      setImageAnalysisError("Silakan pilih atau unggah foto gambar SK terlebih dahulu.");
+      return;
+    }
+
+    setIsGenerating(true);
+    setIsAnalyzingImage(true);
+    setImageAnalysisError(null);
+    setCurrentStep(4);
+
+    const relevantEmployees = employees.filter((e) =>
+      selectedEmployeeIds.includes(e.id)
+    );
+    const docId = initialDoc?.id || draftDoc?.id || `sk-${Date.now()}`;
+    const docStatus = (initialDoc?.status || draftDoc?.status || "draft") as any;
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 90000);
+
+      const response = await fetch("/api/gemini/generate-sk-from-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          imageBase64: imagePreviewUrl,
+          imageMimeType,
+          sekolah: profile,
+          tahunAjaran,
+          keteranganTambahan: imageAdditionalNote || keteranganTambahan,
+          employees: relevantEmployees,
+        }),
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Server status ${response.status}`);
+      }
+
+      const resJson = await response.json();
+      if (resJson.success && resJson.data) {
+        const data = resJson.data;
+        const usedSrc = resJson.source || "gemini-vision";
+        setDraftSource(usedSrc);
+
+        if (data.jenisSK) setSelectedSKType(data.jenisSK);
+        if (data.nomor) setNomorSK(data.nomor);
+        if (data.tahunAjaran) setTahunAjaran(data.tahunAjaran);
+        if (data.tanggalTetap) setTanggalTetap(data.tanggalTetap);
+        if (data.tempatTetap) setTempatTetap(data.tempatTetap);
+        if (data.tanggalRapat) setTanggalRapat(data.tanggalRapat);
+
+        const newDoc: SKDocument = {
+          id: docId,
+          nomor: data.nomor || nomorSK,
+          judul: cleanSKJudul(data.judul || selectedSKType.toUpperCase(), data.tahunAjaran || tahunAjaran),
+          jenisSK: data.jenisSK || selectedSKType,
+          tahunAjaran: data.tahunAjaran || tahunAjaran,
+          tanggalTetap: data.tanggalTetap || tanggalTetap,
+          tempatTetap: data.tempatTetap || tempatTetap,
+          tanggalRapat: data.tanggalRapat || tanggalRapat,
+          perihalRapat: `Rapat Dewan Guru tentang ${data.jenisSK || selectedSKType}`,
+          menimbang: data.menimbang || [
+            `Bahwa untuk memperlancar kegiatan di ${profile.nama}, perlu diterbitkan surat keputusan.`,
+          ],
+          mengingat: data.mengingat || [
+            "Undang-undang Nomor 20 Tahun 2003 tentang Sistem Pendidikan Nasional;",
+            "Peraturan Pemerintah Nomor 4 Tahun 2022 tentang Perubahan atas PP 57 Tahun 2021 tentang Standar Nasional Pendidikan;",
+          ],
+          memperhatikan:
+            data.memperhatikan ||
+            formatMemperhatikanText(tanggalRapat, profile.nama, data.jenisSK || selectedSKType),
+          diktum: data.diktum || [
+            { poin: "KESATU", isi: "Menetapkan keputusan sebagaimana tercantum dalam lampiran ini." },
+            { poin: "KEDUA", isi: "Keputusan ini berlaku sejak tanggal ditetapkan." },
+          ],
+          tembusan: data.tembusan || [
+            `Kepala Dinas Pendidikan Kabupaten ${profile.kabupaten}`,
+            `Korwil SPF Kecamatan ${profile.kecamatan}`,
+            "Arsip",
+          ],
+          lampiranList:
+            data.lampiranList && data.lampiranList.length > 0
+              ? data.lampiranList
+              : createSafeLampiran(data.jenisSK || selectedSKType, relevantEmployees),
+          status: docStatus,
+          kepalaSekolah: profile.kepalaSekolah,
+          sekolah: {
+            nama: profile.nama,
+            alamat: profile.alamat,
+            kabupaten: profile.kabupaten,
+            kecamatan: profile.kecamatan,
+          },
+          aiNotes: [
+            ...(data.aiNotes || []),
+            "Naskah SK berhasil diekstrak dan diselaraskan secara otomatis dari gambar dokumen.",
+          ],
+          createdAt: draftDoc?.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        setDraftDoc(newDoc);
+      } else {
+        throw new Error("Respon analisis gambar tidak valid");
+      }
+    } catch (err: any) {
+      console.warn("Gagal mengekstrak draf dari gambar:", err);
+      setDraftSource("local-vision-fallback");
+      const clientFallback = createSafeClientSKDraft({
+        id: docId,
+        nomorSK,
+        judul: selectedSKType.toUpperCase(),
+        selectedSKType,
+        tahunAjaran,
+        tanggalTetap,
+        tempatTetap,
+        tanggalRapat,
+        profile,
+        relevantEmployees,
+        status: docStatus,
+      });
+      clientFallback.aiNotes = [
+        "Analisis gambar dialihkan ke standar tata naskah dinas pendidikan (offline fallback).",
+      ];
+      setDraftDoc(clientFallback);
+    } finally {
+      setIsGenerating(false);
+      setIsAnalyzingImage(false);
+    }
+  };
+
   // Trigger AI Draft Generation (Step 4)
   const handleGenerateDraft = async () => {
     setIsGenerating(true);
@@ -474,7 +660,7 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      const timeoutId = setTimeout(() => controller.abort(), 90000);
 
       const response = await fetch("/api/gemini/generate-sk", {
         method: "POST",
@@ -718,93 +904,320 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
         </div>
       </div>
 
-      {/* STEP 1: PILIH JENIS SK */}
+      {/* STEP 1: PILIH METODE & JENIS SK */}
       {currentStep === 1 && (
         <div className="bg-white rounded-xl p-6 border border-slate-200 shadow-sm space-y-6 animate-fade-in">
-          <div>
-            <h3 className="text-sm font-bold text-slate-800">
-              Pilih dari 25 Jenis SK Baku Sekolah Dasar atau Buat Kebutuhan Khusus:
-            </h3>
-            <p className="text-xs text-slate-500 mt-1">
-              Sistem telah dilengkapi format konsiderans Menimbang dan dasar hukum Mengingat baku
-              berdasarkan standar pendidikan dasar nasional.
-            </p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-800">
+                Pilih Metode Penyusunan Surat Keputusan (SK) Sekolah:
+              </h3>
+              <p className="text-xs text-slate-500 mt-1">
+                Pilih format baku dinas, ketik kebutuhan sendiri, atau unggah foto/pindaian dokumen fisik untuk disusun otomatis oleh AI Vision.
+              </p>
+            </div>
           </div>
 
-          {/* Quick Natural Prompt Option (Buat SK Berdasarkan Kebutuhan Saya) */}
-          <div className="p-4 bg-emerald-50/70 border border-emerald-200 rounded-xl space-y-3">
-            <div className="flex items-center gap-2">
+          {/* Navigasi Pilihan Metode */}
+          <div className="flex flex-wrap gap-2 p-1.5 bg-slate-100 rounded-xl border border-slate-200 text-xs">
+            <button
+              type="button"
+              id="tab-mode-kategori"
+              onClick={() => {
+                setCreationMode("kategori");
+                setIsCustomMode(false);
+              }}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                creationMode === "kategori"
+                  ? "bg-white text-emerald-800 shadow-xs border border-slate-200"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <FileText className="w-4 h-4 text-emerald-600" />
+              <span>25 Format SK Baku SD</span>
+            </button>
+
+            <button
+              type="button"
+              id="tab-mode-kebutuhan"
+              onClick={() => {
+                setCreationMode("kebutuhan");
+                setIsCustomMode(true);
+              }}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                creationMode === "kebutuhan"
+                  ? "bg-white text-emerald-800 shadow-xs border border-slate-200"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
               <Sparkles className="w-4 h-4 text-emerald-600" />
-              <h4 className="text-xs font-bold text-emerald-900">
-                Opsi Cepat: "Buat SK berdasarkan kebutuhan saya"
-              </h4>
-            </div>
-            <p className="text-xs text-emerald-800">
-              Contoh:{" "}
-              <span className="italic">
-                "Saya membutuhkan SK untuk membentuk tim pelaksana kegiatan peringatan Hari
-                Pendidikan Nasional dan Bulan Bahasa di sekolah."
+              <span>Ketik Kebutuhan Sendiri</span>
+            </button>
+
+            <button
+              type="button"
+              id="tab-mode-gambar"
+              onClick={() => setCreationMode("gambar")}
+              className={`flex items-center gap-2 px-4 py-2.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                creationMode === "gambar"
+                  ? "bg-white text-indigo-800 shadow-xs border border-indigo-200 ring-1 ring-indigo-300"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <Camera className="w-4 h-4 text-indigo-600" />
+              <span>Susun Sesuai Foto / Gambar SK</span>
+              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700 uppercase tracking-wider">
+                AI Vision
               </span>
-            </p>
-            <div className="flex gap-2">
-              <input
+            </button>
+          </div>
+
+          {/* METODE 1: 25 FORMAT SK BAKU SD */}
+          {creationMode === "kategori" && (
+            <div className="space-y-4 animate-fade-in">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 max-h-[460px] overflow-y-auto pr-1">
+                {skCategories.map((cat) => {
+                  const isSelected = selectedSKType === cat.nama && !customPrompt;
+                  return (
+                    <div
+                      key={cat.id}
+                      id={`sk-category-${cat.id}`}
+                      onClick={() => {
+                        handleSelectType(cat.nama);
+                        setCustomPrompt("");
+                      }}
+                      className={`p-3.5 rounded-xl border text-left cursor-pointer transition-all ${
+                        isSelected
+                          ? "border-emerald-600 bg-emerald-50/60 shadow-xs ring-1 ring-emerald-600"
+                          : "border-slate-200 hover:border-slate-300 hover:bg-slate-50/50"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
+                          {cat.kategori}
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-400">#{cat.id}</span>
+                      </div>
+                      <h4 className="text-xs font-bold text-slate-900 leading-snug">{cat.nama}</h4>
+                      <p className="text-[11px] text-slate-500 mt-1 line-clamp-2">{cat.deskripsi}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* METODE 2: PROMPT KEBUTUHAN SENDIRI */}
+          {creationMode === "kebutuhan" && (
+            <div className="p-5 bg-emerald-50/70 border border-emerald-200 rounded-xl space-y-4 animate-fade-in">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-5 h-5 text-emerald-600" />
+                <div>
+                  <h4 className="text-xs font-bold text-emerald-950">
+                    Susun SK Berdasarkan Kebutuhan & Bahasa Sehari-hari
+                  </h4>
+                  <p className="text-[11px] text-emerald-800 mt-0.5">
+                    Ketik tujuan SK yang Anda inginkan, AI akan merumuskan judul, dasar hukum, konsiderans, dan diktum formalnya secara otomatis.
+                  </p>
+                </div>
+              </div>
+              <textarea
                 id="input-custom-sk-prompt"
-                type="text"
+                rows={4}
                 value={customPrompt}
                 onChange={(e) => {
                   setCustomPrompt(e.target.value);
-                  if (e.target.value) setIsCustomMode(true);
+                  setIsCustomMode(true);
+                  setSelectedSKType("SK Lainnya (Custom AI)");
                 }}
-                placeholder="Ketik kebutuhan SK sekolah Anda di sini..."
-                className="w-full text-xs p-2.5 rounded-lg border border-emerald-300 bg-white focus:ring-2 focus:ring-emerald-500"
+                placeholder="Contoh: Saya butuh SK Pembentukan Panitia Pelaksana Perayaan Hari Guru Nasional dan Gebyar Literasi Sekolah Dasar Tahun 2025/2026 yang terdiri dari ketua, sekretaris, bendahara, dan seksi acara..."
+                className="w-full text-xs p-3 rounded-lg border border-emerald-300 bg-white focus:ring-2 focus:ring-emerald-500 text-slate-900 shadow-2xs"
               />
-              <button
-                id="btn-use-custom-prompt"
-                onClick={() => {
-                  if (customPrompt.trim()) {
-                    setSelectedSKType("SK Lainnya (Custom AI)");
-                    setIsCustomMode(true);
-                    setCurrentStep(2);
-                  }
-                }}
-                className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-4 py-2 rounded-lg whitespace-nowrap cursor-pointer"
-              >
-                Gunakan Ini
-              </button>
-            </div>
-          </div>
-
-          {/* 25 Categories Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 max-h-[460px] overflow-y-auto pr-1">
-            {skCategories.map((cat) => {
-              const isSelected = selectedSKType === cat.nama && !customPrompt;
-              return (
-                <div
-                  key={cat.id}
-                  id={`sk-category-${cat.id}`}
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  id="btn-use-custom-prompt"
                   onClick={() => {
-                    handleSelectType(cat.nama);
-                    setCustomPrompt("");
+                    if (customPrompt.trim()) {
+                      setSelectedSKType("SK Lainnya (Custom AI)");
+                      setIsCustomMode(true);
+                      setCurrentStep(2);
+                    }
                   }}
-                  className={`p-3.5 rounded-xl border text-left cursor-pointer transition-all ${
-                    isSelected
-                      ? "border-emerald-600 bg-emerald-50/60 shadow-xs ring-1 ring-emerald-600"
-                      : "border-slate-200 hover:border-slate-300 hover:bg-slate-50/50"
-                  }`}
+                  disabled={!customPrompt.trim()}
+                  className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-semibold px-5 py-2.5 rounded-lg shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
                 >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
-                      {cat.kategori}
-                    </span>
-                    <span className="text-[11px] font-mono text-slate-400">#{cat.id}</span>
-                  </div>
-                  <h4 className="text-xs font-bold text-slate-900 leading-snug">{cat.nama}</h4>
-                  <p className="text-[11px] text-slate-500 mt-1 line-clamp-2">{cat.deskripsi}</p>
-                </div>
-              );
-            })}
-          </div>
+                  <span>Lanjut ke Data Sekolah</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
 
+          {/* METODE 3: SUSUN SESUAI FOTO / GAMBAR DOKUMEN SK (AI VISION OCR) */}
+          {creationMode === "gambar" && (
+            <div className="p-5 bg-indigo-50/50 border border-indigo-200 rounded-xl space-y-5 animate-fade-in">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-sm">
+                  <Camera className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                    <span>Susun Sesuai Foto / Gambar Dokumen SK Fisik</span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-200">
+                      Gemini Vision OCR
+                    </span>
+                  </h4>
+                  <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
+                    Unggah foto kertas SK atau pindaian dokumen Surat Keputusan. AI Vision akan membaca naskah, nomor surat, konsiderans menimbang, dasar hukum mengingat, diktum memutuskan, serta tabel lampiran guru secara otomatis.
+                  </p>
+                </div>
+              </div>
+
+              {/* Upload Dropzone */}
+              {!imagePreviewUrl ? (
+                <div
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                      handleImageFileSelect(e.dataTransfer.files[0]);
+                    }
+                  }}
+                  className="border-2 border-dashed border-indigo-300 hover:border-indigo-500 bg-white rounded-xl p-8 text-center transition-all space-y-4"
+                >
+                  <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
+                    <Upload className="w-6 h-6" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs font-bold text-slate-800">
+                      Tarik & lepas foto dokumen SK di sini, atau pilih dari perangkat
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Mendukung format JPG, PNG, atau WebP (dokumen pindaian atau foto kamera ponsel)
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap justify-center gap-2 pt-1">
+                    <label
+                      htmlFor="input-file-sk-image"
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition-all cursor-pointer"
+                    >
+                      <ImageIcon className="w-4 h-4" />
+                      <span>Pilih File Gambar</span>
+                    </label>
+                    <input
+                      id="input-file-sk-image"
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files[0]) {
+                          handleImageFileSelect(e.target.files[0]);
+                        }
+                      }}
+                      className="hidden"
+                    />
+
+                    <label
+                      htmlFor="input-camera-sk-image"
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-slate-50 text-indigo-700 border border-indigo-300 rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer"
+                    >
+                      <Camera className="w-4 h-4" />
+                      <span>Ambil Foto dengan Kamera</span>
+                    </label>
+                    <input
+                      id="input-camera-sk-image"
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files[0]) {
+                          handleImageFileSelect(e.target.files[0]);
+                        }
+                      }}
+                      className="hidden"
+                    />
+                  </div>
+                </div>
+              ) : (
+                /* Preview Gambar yang Dipilih */
+                <div className="bg-white rounded-xl p-4 border border-indigo-200 shadow-2xs space-y-4">
+                  <div className="flex flex-col sm:flex-row items-center gap-4">
+                    <div className="relative w-full sm:w-48 h-40 bg-slate-100 rounded-lg overflow-hidden border border-slate-200 flex items-center justify-center shrink-0">
+                      <img
+                        src={imagePreviewUrl}
+                        alt="Foto Dokumen SK"
+                        className="w-full h-full object-contain"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setImagePreviewUrl(null);
+                          setImageFileName(null);
+                        }}
+                        className="absolute top-1.5 right-1.5 p-1 bg-black/60 hover:bg-black/80 text-white rounded-full transition-colors cursor-pointer"
+                        title="Hapus foto ini"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    <div className="flex-1 space-y-2 text-xs">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        <span className="font-bold text-slate-800">
+                          {imageFileName || "Foto Dokumen SK Siap Diproses"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500">
+                        Foto berhasil dimuat. Tambahkan catatan khusus jika ingin menyelaraskan nama guru atau data tertentu:
+                      </p>
+                      <input
+                        type="text"
+                        value={imageAdditionalNote}
+                        onChange={(e) => setImageAdditionalNote(e.target.value)}
+                        placeholder="Contoh: 'Tahun ajaran 2025/2026, sertakan daftar 11 guru SD Negeri 3 Loloan Timur'"
+                        className="w-full p-2.5 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex flex-wrap justify-between items-center gap-3 border-t border-slate-100">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImagePreviewUrl(null);
+                        setImageFileName(null);
+                      }}
+                      className="text-xs text-slate-500 hover:text-slate-800 font-medium cursor-pointer"
+                    >
+                      Ganti Foto Lain
+                    </button>
+
+                    <button
+                      type="button"
+                      id="btn-process-sk-image"
+                      onClick={handleGenerateDraftFromImage}
+                      disabled={isGenerating}
+                      className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
+                    >
+                      <Sparkles className="w-4 h-4 text-indigo-200" />
+                      <span>Ekstrak & Susun Draf SK Sesuai Gambar Ini</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {imageAnalysisError && (
+                <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-xs flex items-center gap-2 animate-fade-in font-medium">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{imageAnalysisError}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Tombol Navigasi Bawah Step 1 */}
           <div className="flex flex-wrap justify-between items-center gap-3 pt-4 border-t border-slate-100">
             <button
               onClick={onCancel}
@@ -1198,21 +1611,42 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
               <Loader2 className="w-10 h-10 text-emerald-600 animate-spin mx-auto" />
               <div className="space-y-1.5 max-w-md mx-auto">
                 <h3 className="text-base font-bold text-slate-900">
-                  AI sedang menyusun draf Surat Keputusan resmi...
+                  {isAnalyzingImage
+                    ? "AI Gemini Vision sedang membaca foto dokumen SK..."
+                    : "AI sedang menyusun draf Surat Keputusan resmi..."}
                 </h3>
                 <p className="text-xs text-slate-500">
-                  Menyusun konsiderans Menimbang, memeriksa dasar hukum Mengingat terkini,
-                  merumuskan diktum MEMUTUSKAN KESATU - KEDELAPAN, serta mengompilasi lampiran tabel
-                  guru dan PTK.
+                  {isAnalyzingImage
+                    ? "Mengekstrak kop, judul, nomor, konsiderans menimbang, dasar hukum mengingat, diktum memutuskan, serta tabel lampiran guru langsung dari gambar."
+                    : "Menyusun konsiderans Menimbang, memeriksa dasar hukum Mengingat terkini, merumuskan diktum MEMUTUSKAN KESATU - KEDELAPAN, serta mengompilasi lampiran tabel guru dan PTK."}
                 </p>
                 <div className="pt-2 flex items-center justify-center gap-2 text-[11px] text-emerald-700 font-medium">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
-                  <span>Sedang diproses oleh Gemini AI (rata-rata 3-8 detik)...</span>
+                  <span>
+                    {isAnalyzingImage
+                      ? "Sedang memproses OCR & ekstraksi cerdas AI (rata-rata 5-15 detik)..."
+                      : "Sedang diproses oleh Gemini AI (rata-rata 3-8 detik)..."}
+                  </span>
                 </div>
               </div>
             </div>
           ) : draftDoc ? (
             <div className="space-y-6 text-left">
+              {/* Pratinjau Kop Surat Resmi jika Mode Gambar Aktif */}
+              {profile.kopMode === "gambar" && activeKopUrl && (
+                <div className="p-3 bg-white border border-slate-200 rounded-xl text-center shadow-2xs">
+                  <img
+                    src={activeKopUrl}
+                    alt="Kop Surat Satuan Pendidikan"
+                    className="max-h-24 sm:max-h-28 mx-auto object-contain"
+                  />
+                  <div className="flex items-center justify-center gap-1.5 text-[11px] text-emerald-700 font-medium mt-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Kop Surat Resmi Sekolah (Mode Gambar) Aktif</span>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-100 pb-5">
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1220,7 +1654,12 @@ export const SKBuilderWizard: React.FC<SKBuilderWizardProps> = ({
                       <CheckCircle2 className="w-4 h-4" />
                       <span>Draf Formal SK Sesuai Regulasi Dinas</span>
                     </div>
-                    {draftSource && (draftSource.includes("gemini") || draftSource.includes("flash")) ? (
+                    {draftSource && draftSource.includes("vision") ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-100 text-indigo-800 border border-indigo-300">
+                        <Camera className="w-3 h-3 text-indigo-600" />
+                        Disusun dari Foto Gambar oleh AI Vision ({draftSource})
+                      </span>
+                    ) : draftSource && (draftSource.includes("gemini") || draftSource.includes("flash")) ? (
                       <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300">
                         <Sparkles className="w-3 h-3 text-emerald-600" />
                         Disusun oleh AI Gemini ({draftSource})

@@ -105,7 +105,13 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
   const detectSuggestedAction = (text: string) => {
     const lowText = text.toLowerCase();
-    if (lowText.includes("surat tugas") || lowText.includes("spt") || lowText.includes("bimtek") || lowText.includes("pelatihan") || lowText.includes("lomba") || lowText.includes("workshop")) {
+    if (lowText.includes("foto") || lowText.includes("gambar") || lowText.includes("scan") || lowText.includes("kamera")) {
+      return {
+        label: "📸 Buka Pembuat SK & Susun Sesuai Foto/Gambar Dokumen",
+        skType: "SK Pembagian Tugas Guru dalam KBM",
+        actionType: "sk" as const,
+      };
+    } else if (lowText.includes("surat tugas") || lowText.includes("spt") || lowText.includes("bimtek") || lowText.includes("pelatihan") || lowText.includes("lomba") || lowText.includes("workshop")) {
       return {
         label: "Buat Surat Tugas (SPT) ini Sekarang",
         skType: "Surat Tugas",

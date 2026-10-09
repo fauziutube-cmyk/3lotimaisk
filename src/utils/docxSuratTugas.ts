@@ -13,6 +13,8 @@ import {
 } from "docx";
 import { saveAs } from "file-saver";
 import { SuratTugasDocument, SchoolProfile } from "../types";
+import { loadActiveKopImage } from "./storage";
+import { defaultKopSuratSDN3LoloanTimur } from "../data/defaultKopImage";
 
 function base64ToUint8Array(base64: string): Uint8Array {
   try {
@@ -85,10 +87,19 @@ export async function exportSuratTugasToDocx(
   const children: any[] = [];
 
   // 1. Kop Surat
-  const activeKop = school.kopSuratUrl;
+  let activeKop = school.kopSuratUrl;
+  if (school.kopMode === "gambar") {
+    if (!activeKop || activeKop.startsWith("indexeddb:")) {
+      try {
+        activeKop = await loadActiveKopImage(defaultKopSuratSDN3LoloanTimur);
+      } catch {}
+    }
+  }
+
   const isImageKop =
     activeKop &&
-    (school.kopMode === "gambar" || activeKop.startsWith("data:image/"));
+    !activeKop.startsWith("indexeddb:") &&
+    (school.kopMode === "gambar" || activeKop.startsWith("data:image/") || activeKop.startsWith("data:image/svg+xml"));
 
   if (isImageKop && activeKop) {
     try {

@@ -15,6 +15,8 @@ import {
 import { saveAs } from "file-saver";
 import { SKDocument, SchoolProfile } from "../types";
 import { cleanSKJudul } from "./skFormatter";
+import { loadActiveKopImage } from "./storage";
+import { defaultKopSuratSDN3LoloanTimur } from "../data/defaultKopImage";
 
 function base64ToUint8Array(base64: string): Uint8Array {
   try {
@@ -92,26 +94,34 @@ export async function exportSKToDocx(doc: SKDocument, profile: SchoolProfile) {
 
   // --- KOP SURAT ---
   let isImageKopAdded = false;
-  if (profile.kopMode === "gambar" && profile.kopSuratUrl) {
+  if (profile.kopMode === "gambar") {
     try {
-      const { data: imgBytes, type: imgType } = await getRasterImageBytes(profile.kopSuratUrl);
-      children.push(
-        new Paragraph({
-          alignment: AlignmentType.CENTER,
-          spacing: { after: 120 },
-          children: [
-            new ImageRun({
-              type: imgType,
-              data: imgBytes,
-              transformation: {
-                width: 580,
-                height: 120,
-              },
-            }),
-          ],
-        })
-      );
-      isImageKopAdded = true;
+      let rawKopUrl = profile.kopSuratUrl;
+      if (!rawKopUrl || rawKopUrl.startsWith("indexeddb:")) {
+        rawKopUrl = await loadActiveKopImage(defaultKopSuratSDN3LoloanTimur);
+      }
+      if (rawKopUrl && !rawKopUrl.startsWith("indexeddb:")) {
+        const { data: imgBytes, type: imgType } = await getRasterImageBytes(rawKopUrl);
+        if (imgBytes && imgBytes.length > 0) {
+          children.push(
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              spacing: { after: 120 },
+              children: [
+                new ImageRun({
+                  type: imgType,
+                  data: imgBytes,
+                  transformation: {
+                    width: 580,
+                    height: 120,
+                  },
+                }),
+              ],
+            })
+          );
+          isImageKopAdded = true;
+        }
+      }
     } catch (e) {
       console.warn("Gagal menyematkan gambar kop di Word, beralih ke teks:", e);
       isImageKopAdded = false;
